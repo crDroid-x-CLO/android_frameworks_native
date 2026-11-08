@@ -170,8 +170,6 @@ std::optional<PhysicalDisplayId> HWComposer::onVsync(hal::HWDisplayId hwcDisplay
         // is a bug in the HWC implementation, but filter the extra events
         // out here so they don't cause havoc downstream.
         if (timestamp == displayData.lastPresentTimestamp) {
-            ALOGW("Ignoring duplicate VSYNC event from HWC for display %s (t=%" PRId64 ")",
-                  to_string(*displayIdOpt).c_str(), timestamp);
             return {};
         }
 
@@ -732,6 +730,10 @@ status_t HWComposer::presentAndGetReleaseFences(
     return NO_ERROR;
 }
 
+bool HWComposer::isLayerCommandBatchingEnabled() const {
+    return mComposer->isLayerCommandBatchingEnabled();
+}
+
 status_t HWComposer::executeCommands(HalDisplayId displayId) {
     RETURN_IF_INVALID_DISPLAY(displayId, BAD_INDEX);
 
@@ -1202,6 +1204,9 @@ status_t HWComposer::getLuts(PhysicalDisplayId displayId,
     RETURN_IF_INVALID_DISPLAY(displayId, BAD_INDEX);
     auto& hwcDisplay = mDisplayData[displayId].hwcDisplay;
     auto error = hwcDisplay->getLuts(buffers, luts);
+    if (error == hal::Error::UNSUPPORTED) {
+        return NO_ERROR;
+    }
     RETURN_IF_HWC_ERROR(error, displayId, UNKNOWN_ERROR);
     return NO_ERROR;
 }

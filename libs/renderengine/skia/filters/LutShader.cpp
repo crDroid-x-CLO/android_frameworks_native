@@ -20,8 +20,10 @@
 #include <common/trace.h>
 #include <cutils/ashmem.h>
 #include <include/core/SkColorSpace.h>
+#include <log/log.h>
 #include <math/half.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <ui/ColorSpace.h>
 
 #include <renderengine/ColorSpaces.h>

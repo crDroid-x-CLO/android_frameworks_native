@@ -123,7 +123,10 @@ cc_defaults {
     cflags: [
         "-DEGL_EGLEXT_PROTOTYPES",
         "-DGL_GLEXT_PROTOTYPES",
-    ],
+    ] + select(soong_config_variable("qtidisplay", "headers_namespace"), {
+        any @ flag_val: ["-DQCOM_UM_FAMILY"],
+        default: [],
+    }),
     shared_libs: [
         "android.hardware.common-V2-ndk",
         "android.hardware.common.fmq-V1-ndk",
@@ -177,7 +180,10 @@ cc_defaults {
         "android.hardware.graphics.composer@2.2-command-buffer",
         "android.hardware.graphics.composer@2.3-command-buffer",
         "android.hardware.graphics.composer@2.4-command-buffer",
-    ],
+    ] + select(soong_config_variable("qtidisplay", "headers_namespace"), {
+        any @ flag_val: ["//" + flag_val + ":display_intf_headers"],
+        default: [],
+    }),
     export_static_lib_headers: [
         "libcompositionengine",
         "librenderengine",
@@ -339,7 +345,10 @@ cc_defaults {
     ],
     cflags: [
         "-DLOG_TAG=\"SurfaceFlinger\"",
-    ],
+    ] + select(soong_config_variable("surfaceflinger", "register_displayservice"), {
+        true: ["-DREGISTER_DISPLAYSERVICE"],
+        default: [],
+    }),
     shared_libs: [
         "android.hardware.graphics.allocator@2.0",
         "android.hardware.graphics.allocator@3.0",
@@ -353,7 +362,14 @@ cc_defaults {
     ],
     static_libs: [
         "libserviceutils",
-    ],
+    ] + select(soong_config_variable("surfaceflinger", "register_displayservice"), {
+        true: ["lineage.frameworks.displayservice@1.0", "libdisplayservicehidl"],
+        default: [],
+    }),
+    required: select(soong_config_variable("surfaceflinger", "register_displayservice"), {
+        true: ["lineage.frameworks.displayservice@1.0.xml"],
+        default: [],
+    }),
 }
 
 filegroup {

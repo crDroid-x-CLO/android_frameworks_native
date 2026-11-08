@@ -186,6 +186,8 @@ public:
             HalDisplayId,
             std::optional<std::chrono::steady_clock::time_point> earliestPresentTime) = 0;
 
+    virtual bool isLayerCommandBatchingEnabled() const = 0;
+
     virtual status_t executeCommands(HalDisplayId) = 0;
 
     // set power mode
@@ -409,6 +411,8 @@ public:
     status_t presentAndGetReleaseFences(
             HalDisplayId,
             std::optional<std::chrono::steady_clock::time_point> earliestPresentTime) override;
+
+    bool isLayerCommandBatchingEnabled() const override;
 
     status_t executeCommands(HalDisplayId) override;
 

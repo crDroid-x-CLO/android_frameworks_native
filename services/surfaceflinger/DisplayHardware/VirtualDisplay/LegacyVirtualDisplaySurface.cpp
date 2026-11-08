@@ -60,7 +60,8 @@ namespace android {
 LegacyVirtualDisplaySurface::LegacyVirtualDisplaySurface(HWComposer& hwc,
                                                          VirtualDisplayIdVariant virtualIdVariant,
                                                          const sp<Surface>& sink,
-                                                         const std::string& name, bool qtiSecure)
+                                                         const std::string& name,
+                                                         bool secure)
       : ConsumerBase(),
         mHwc(hwc),
         mVirtualIdVariant(virtualIdVariant),
@@ -82,7 +83,9 @@ LegacyVirtualDisplaySurface::LegacyVirtualDisplaySurface(HWComposer& hwc,
 // QTI_BEGIN: 2025-06-29: Display: sf: Add FBT WCG blending space support for WFD am: d8cd658cc9 am: d8cd658cc9
         mQtiVdsDataSpace(ui::Dataspace::UNKNOWN),
 // QTI_END: 2025-06-29: Display: sf: Add FBT WCG blending space support for WFD am: d8cd658cc9 am: d8cd658cc9
-        mForceHwcCopy(SurfaceFlinger::useHwcForRgbToYuv) {
+        mForceHwcCopy(SurfaceFlinger::useHwcForRgbToYuv),
+        mSecure(secure),
+        mSinkUsage(0) {
     mSource[SOURCE_SINK] = sink->getIGraphicBufferProducer();
     mSource[SOURCE_SCRATCH] = mSurface->getIGraphicBufferProducer();
 
@@ -100,11 +103,13 @@ LegacyVirtualDisplaySurface::LegacyVirtualDisplaySurface(HWComposer& hwc,
     // on usage bits.
     int sinkUsage;
     sink->query(NATIVE_WINDOW_CONSUMER_USAGE_BITS, &sinkUsage);
+    mSinkUsage |= (GRALLOC_USAGE_HW_COMPOSER | sinkUsage);
+    setOutputUsage(mSinkUsage);
 
 // QTI_BEGIN: 2023-03-06: Display: SF: Squash commit of SF Extensions.
     if (!mQtiDSExtnIntf) {
         mQtiDSExtnIntf = surfaceflingerextension::
-                qtiCreateDisplaySurfaceExtension(/* isVirtual */ true, this, qtiSecure, sinkUsage,
+                qtiCreateDisplaySurfaceExtension(/* isVirtual */ true, this, secure, sinkUsage,
                                                  /* FramebufferSurface */ nullptr);
     }
 // QTI_END: 2023-03-06: Display: SF: Squash commit of SF Extensions.
@@ -380,6 +385,14 @@ status_t LegacyVirtualDisplaySurface::dequeueBuffer(Source source, PixelFormat f
     }
 
 // QTI_END: 2023-01-24: Display: sf: Add support for multiple displays
+    // Exclude video encoder usage flag from scratch buffer usage flags.
+    if (source == SOURCE_SCRATCH) {
+        usage |= GRALLOC_USAGE_HW_FB;
+        usage &= ~(GRALLOC_USAGE_HW_VIDEO_ENCODER);
+        VDS_LOGV("%s(%s): updated scratch buffer usage flags=%#" PRIx64,
+                __func__, ftl::enum_string(source).c_str(), usage);
+    }
+
     status_t result =
             mSource[source]->dequeueBuffer(sslot, fence, mSinkBufferWidth, mSinkBufferHeight,
                                            format, usage, nullptr, nullptr);
@@ -407,11 +420,11 @@ status_t LegacyVirtualDisplaySurface::dequeueBuffer(Source source, PixelFormat f
         }
     }
     if (result & BUFFER_NEEDS_REALLOCATION) {
-        result = mSource[source]->requestBuffer(*sslot, &mProducerBuffers[pslot]);
-        if (result < 0) {
+        auto status  = mSource[source]->requestBuffer(*sslot, &mProducerBuffers[pslot]);
+        if (status < 0) {
             mProducerBuffers[pslot].clear();
             mSource[source]->cancelBuffer(*sslot, *fence);
-            return result;
+            return status;
         }
         VDS_LOGV("%s(%s): buffers[%d]=%p fmt=%d usage=%#" PRIx64, __func__,
                  ftl::enum_string(source).c_str(), pslot, mProducerBuffers[pslot].get(),
@@ -736,6 +749,21 @@ auto LegacyVirtualDisplaySurface::fbSourceForCompositionType(CompositionType typ
 std::string LegacyVirtualDisplaySurface::toString(CompositionType type) {
     using namespace std::literals;
     return type == CompositionType::Unknown ? "Unknown"s : ftl::Flags(type).string();
+}
+
+/* Helper to update the output usage when the display is secure */
+
+void LegacyVirtualDisplaySurface::setOutputUsage(uint64_t /*flag*/) {
+
+    mOutputUsage = mSinkUsage;
+    if (mSecure && (mOutputUsage & GRALLOC_USAGE_HW_VIDEO_ENCODER)) {
+        /*TODO: Currently, the framework can only say whether the display
+         * and its subsequent session are secure or not. However, there is
+         * no mechanism to distinguish the different levels of security.
+         * The current solution assumes WV L3 protection.
+         */
+        mOutputUsage |= GRALLOC_USAGE_PROTECTED;
+    }
 }
 
 } // namespace android

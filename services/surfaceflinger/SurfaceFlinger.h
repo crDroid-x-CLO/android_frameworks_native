@@ -1084,6 +1084,8 @@ private:
             ScreenshotArgs& args, const std::shared_ptr<renderengine::ExternalTexture>&,
             ScreenCaptureResults&);
 
+    bool canAllocateHwcDisplayIdForVDS(uint64_t usage);
+
     void readPersistentProperties();
 
     uint32_t getMaxAcquiredBufferCountForCurrentRefreshRate(uid_t uid) const;
@@ -1300,7 +1302,8 @@ private:
     // Virtual display lifecycle for ID generation and HAL allocation.
     std::optional<VirtualDisplayIdVariant> acquireVirtualDisplay(
             ui::Size, ui::PixelFormat, const std::string& uniqueId,
-            compositionengine::DisplayCreationArgsBuilder&) REQUIRES(mStateLock);
+            compositionengine::DisplayCreationArgsBuilder&, bool canAllocateHwcDisplayIdForVDS)
+            REQUIRES(mStateLock);
 
     template <typename ID>
     bool acquireVirtualDisplaySnapshot(ID displayId, const std::string& uniqueId) {
@@ -1588,6 +1591,7 @@ private:
     std::atomic_bool mForceFullDamage = false;
 
     bool mLayerCachingEnabled = false;
+    bool mPropagateBackpressure = true;
     bool mBackpressureGpuComposition = false;
 
     LayerTracing mLayerTracing;
@@ -1706,6 +1710,10 @@ private:
     getLayerSnapshotsForScreenshots(const SnapshotRequestArgs& args) REQUIRES(kMainThreadContext);
 
     const sp<WindowInfosListenerInvoker> mWindowInfosListenerInvoker;
+
+    bool mAllowHwcForVDS = false;
+    bool mAllowHwcForWFD = false;
+    int mFirstApiLevel = 0;
 
     // returns the framerate of the layer with the given sequence ID
     float getLayerFramerate(nsecs_t now, int32_t id) const {

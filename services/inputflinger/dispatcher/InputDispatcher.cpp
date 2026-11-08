@@ -709,6 +709,10 @@ std::vector<TouchedWindow> getHoveringWindowsLocked(const TouchState* oldState,
                     // has known inconsistencies, so log ERROR instead of
                     // crashing the device with FATAL.
                     severity = android::base::LogSeverity::ERROR;
+                } else if (entry.isSynthesized()) {
+                    // Synthetic or injected events may produce an inconsistent hover stream
+                    // Downgrade to a warning rather than crashing the system.
+                    severity = android::base::LogSeverity::WARNING;
                 }
                 dump();
                 LOG(severity) << "Expected ACTION_HOVER_MOVE instead of " << entry.getDescription();
@@ -2159,14 +2163,20 @@ bool InputDispatcher::flushSensor(int deviceId, InputDeviceSensorType sensorType
             << ", sensorType=" << ftl::enum_string(sensorType).c_str();
     { // acquire lock
         std::scoped_lock _l(mLock);
-
-        for (auto it = mInboundQueue.begin(); it != mInboundQueue.end(); it++) {
-            std::shared_ptr<const EventEntry> entry = *it;
-            if (entry->type == EventEntry::Type::SENSOR) {
-                it = mInboundQueue.erase(it);
-                releaseInboundEventLocked(entry);
-            }
-        }
+        std::erase_if(mInboundQueue,
+                      [this, deviceId, sensorType](const std::shared_ptr<const EventEntry>& entry)
+                              REQUIRES(mLock) {
+                                  if (entry->type != EventEntry::Type::SENSOR) {
+                                      return false;
+                                  }
+                                  const auto& sensorEntry = static_cast<const SensorEntry&>(*entry);
+                                  if (sensorEntry.deviceId != deviceId ||
+                                      sensorEntry.sensorType != sensorType) {
+                                      return false;
+                                  }
+                                  releaseInboundEventLocked(entry);
+                                  return true;
+                              });
     }
     return true;
 }

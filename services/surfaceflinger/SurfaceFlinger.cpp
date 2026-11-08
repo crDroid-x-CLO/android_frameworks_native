@@ -197,6 +197,14 @@
 #include "Utils/Dumper.h"
 #include "WindowInfosListenerInvoker.h"
 
+#ifdef QCOM_UM_FAMILY
+#if __has_include("QtiGralloc.h")
+#include "QtiGralloc.h"
+#else
+#include "gralloc_priv.h"
+#endif
+#endif
+
 #include <aidl/android/hardware/graphics/common/DisplayDecorationSupport.h>
 #include <aidl/android/hardware/graphics/composer3/DisplayCapability.h>
 #include <aidl/android/hardware/graphics/composer3/OutputType.h>
@@ -522,7 +530,9 @@ SurfaceFlinger::SurfaceFlinger(Factory& factory) : SurfaceFlinger(factory, SkipI
 
     useHwcForRgbToYuv = force_hwc_copy_for_virtual_displays(false);
 
-    maxFrameBufferAcquiredBuffers = max_frame_buffer_acquired_buffers(2);
+    int64_t buffers = max_frame_buffer_acquired_buffers(2);
+    maxFrameBufferAcquiredBuffers = buffers < 3 ? buffers : 6;
+
     minAcquiredBuffers =
             SurfaceFlingerProperties::min_acquired_buffers().value_or(minAcquiredBuffers);
     maxAcquiredBuffersOpt = SurfaceFlingerProperties::max_acquired_buffers();
@@ -559,6 +569,10 @@ SurfaceFlinger::SurfaceFlinger(Factory& factory) : SurfaceFlinger(factory, SkipI
     mIsUserBuild = strcmp(value, "user") == 0;
 
     mDebugFlashDelay = base::GetUintProperty("debug.sf.showupdates"s, 0u);
+
+    property_get("debug.sf.disable_backpressure", value, "0");
+    mPropagateBackpressure = !atoi(value);
+    ALOGI_IF(!mPropagateBackpressure, "Disabling backpressure propagation");
 
     mBackpressureGpuComposition = base::GetBoolProperty("debug.sf.enable_gl_backpressure"s, true);
     ALOGI_IF(mBackpressureGpuComposition, "Enabling backpressure for GPU composition");
@@ -629,6 +643,9 @@ SurfaceFlinger::SurfaceFlinger(Factory& factory) : SurfaceFlinger(factory, SkipI
 }
 
 LatchUnsignaledConfig SurfaceFlinger::getLatchUnsignaledConfig() {
+    if (base::GetBoolProperty("debug.sf.latch_unsignaled"s, false)) {
+        return LatchUnsignaledConfig::Always;
+    }
     if (base::GetBoolProperty("debug.sf.auto_latch_unsignaled"s, true)) {
         return LatchUnsignaledConfig::AutoSingleLayer;
     }
@@ -745,16 +762,18 @@ void SurfaceFlinger::enableHalVirtualDisplays(bool enable) {
 
 std::optional<VirtualDisplayIdVariant> SurfaceFlinger::acquireVirtualDisplay(
         ui::Size resolution, ui::PixelFormat format, const std::string& uniqueId,
-        compositionengine::DisplayCreationArgsBuilder& builder) {
-    if (auto& generator = mVirtualDisplayIdGenerators.hal) {
-        if (const auto halIdOpt = generateVirtualDisplayId(*generator)) {
+        compositionengine::DisplayCreationArgsBuilder& builder,
+        bool canAllocateHwcForVDS) {
+    auto& hwcGenerator = mVirtualDisplayIdGenerators.hal;
+    if (canAllocateHwcForVDS && hwcGenerator) {
+        if (const auto halIdOpt = generateVirtualDisplayId(*hwcGenerator)) {
             if (getHwComposer().allocateVirtualDisplay(*halIdOpt, resolution, &format) &&
                 acquireVirtualDisplaySnapshot(*halIdOpt, uniqueId)) {
                 builder.setId(*halIdOpt);
                 return *halIdOpt;
             }
 
-            generator->releaseId(*halIdOpt);
+            hwcGenerator->releaseId(*halIdOpt);
         }
         ALOGW("%s: Falling back to GPU virtual display", __func__);
     }
@@ -966,6 +985,8 @@ renderengine::RenderEngine::BlurAlgorithm chooseBlurAlgorithm(bool supportsBlur)
         return renderengine::RenderEngine::BlurAlgorithm::Gaussian;
     } else if (algorithm == "kawase") {
         return renderengine::RenderEngine::BlurAlgorithm::Kawase;
+    } else if (algorithm == "kawase_darkmoon") {
+        return renderengine::RenderEngine::BlurAlgorithm::KawaseDarkmoon;
     } else {
         return renderengine::RenderEngine::BlurAlgorithm::KawaseDualFilterV2;
     }
@@ -1020,6 +1041,10 @@ void SurfaceFlinger::init() FTL_FAKE_GUARD(kMainThreadContext) {
             !getHwComposer().hasCapability(Capability::PRESENT_FENCE_IS_NOT_RELIABLE);
 
     enableLatchUnsignaledConfig = getLatchUnsignaledConfig();
+
+    mAllowHwcForWFD = base::GetBoolProperty("vendor.display.vds_allow_hwc"s, false);
+    mAllowHwcForVDS = mAllowHwcForWFD && base::GetBoolProperty("debug.sf.enable_hwc_vds"s, false);
+    mFirstApiLevel = android::base::GetIntProperty("ro.product.first_api_level", 0);
 
     // Process hotplug for displays connected at boot.
     LOG_ALWAYS_FATAL_IF(!configureLocked(),
@@ -3278,7 +3303,7 @@ bool SurfaceFlinger::commit(PhysicalDisplayId pacesetterId,
     }
 
     if (pacesetterFrameTargetPtr->wouldBackpressureHwc()) {
-        if (mBackpressureGpuComposition || pacesetterFrameTargetPtr->didMissHwcFrame()) {
+        if (mPropagateBackpressure && (mBackpressureGpuComposition || pacesetterFrameTargetPtr->didMissHwcFrame())) {
             mScheduler->getVsyncSchedule()->getTracker().onFrameMissed(
                     pacesetterFrameTargetPtr->expectedPresentTime());
             const Duration slack = TimePoint::now() - pacesetterFrameTargetPtr->frameBeginTime();
@@ -4469,6 +4494,81 @@ bool SurfaceFlinger::configureLocked() {
     }
 
     for (const auto [hwcDisplayId, event] : events) {
+        // Work around a bug in android.hardware.composer.hwc3-service.pixel where
+        // ExynosExternalDisplay::closeExternalDisplay() does not clean up its mIgnoreLayers vector.
+        // When disconnecting an external display, destroy all HWC layers for the external display
+        // before onHotplug() removes the AIDL writer. This ensures that
+        // ExynosDisplay::destroyLayer() gets called in Pixel HWC which cleans both mLayers and
+        // mIgnoreLayers.
+        //
+        // clearOutputLayers() triggers the following destructor chain:
+        //
+        // Output::clearOutputLayers() [compositionengine/impl/Output.h]
+        //   -> vector<unique_ptr<OutputLayer>>::clear()
+        //   -> ~OutputLayer() -> ~OutputLayerCompositionState()
+        //   -> ~Hwc() [impl/OutputLayerCompositionState.h]
+        //   -> ~shared_ptr<HWC2::Layer>() (last owner, weak_ptr in HWC2::Display::mLayers)
+        //   -> HWC2::Layer::~Layer() [HWC2.cpp]
+        //   -> onOwningDisplayDestroyed() [HWC2.cpp]
+        //   -> mDisplay->onLayerDestroyed(mId) -- erases from mLayers
+        //   -> mComposer.destroyLayer(displayId, mId) [AidlComposerHal.cpp]
+        //   -> [batching enabled] queues DESTROY in writer, not sent to HAL yet
+        //
+        // executeCommands() flushes the batched DESTROY commands to the HAL:
+        //
+        // HWComposer::executeCommands() [HWComposer.cpp]
+        //   -> AidlComposer::execute() [AidlComposerHal.cpp]
+        //     -> writer->takePendingCommands() -- drains DESTROY commands from writer
+        //     -> mAidlComposerClient->executeCommands() -- sends to HAL over AIDL
+        //       -> ExynosDisplay::destroyLayer() [hardware/google/graphics/common ExynosDisplay.cpp]
+        //         -> removes layer from mLayers or mIgnoreLayers, deletes it
+        //
+        // Both must happen before onHotplug() calls removeDisplay() which erases the writer via
+        // mWriters.erase(display) [AidlComposerHal.cpp]
+        //
+        // When command batching is enabled, then, without this fix, layers are destroyed too late
+        // by the following existing path due to command batching being enabled:
+        //
+        // onHotplug(Disconnected)
+        //   -> HWComposer::onHotplugDisconnect() [HWComposer.cpp]
+        //     -> mComposer->onHotplugDisconnect()
+        //       -> AidlComposer::removeDisplay() -- mWriters.erase(display) (**)
+        // ... (next transaction commit) ...
+        // processDisplayRemoved() [SurfaceFlinger.cpp]
+        //   -> display->disconnect()
+        //   -> HWComposer::disconnectDisplay() [HWComposer.cpp]
+        //   -> mDisplayData.erase(displayId)
+        //   -> HWC2::Display::~Display() [HWC2.cpp]
+        //   -> for each layer: onOwningDisplayDestroyed():
+        //      -> mComposer.destroyLayer() [AidlComposerHal.cpp]
+        //      -> enters getWriter(display)
+        //      -> [batching] getWriter(display) returns null
+        //         due to (**) from onHotplug(Disconnected) removing the writer -> BAD_DISPLAY
+        //      -> command never reaches HAL, layers left in mIgnoreLayers
+        //
+        // If command batching was disabled, processDisplayRemoved() -> HWC2::Display::~Display()
+        // actually gets the Pixel HWC to clear mIgnoreLayers properly, since it makes a
+        // direct mAidlComposerClient->destroyLayer call. That is, with command batching disabled,
+        // this use-after-free bug doesn't occur.
+        if (event == HWComposer::HotplugEvent::Disconnected &&
+                getHwComposer().isLayerCommandBatchingEnabled()) {
+            if (const auto displayIdOpt = getHwComposer().toPhysicalDisplayId(hwcDisplayId)) {
+                if (getHwComposer().getDisplayConnectionType(*displayIdOpt) == ui::DisplayConnectionType::External &&
+                        base::GetProperty("ro.product.manufacturer", "") == "Google") {
+                    // we're in a function called configureLocked, so assume mStateLock is being
+                    // held
+                    if (const auto display = getDisplayDeviceLocked(*displayIdOpt)) {
+                        ALOGI("Clearing output layers for external display %" PRIu64
+                              " before hotplug disconnect to work around stale pointer in"
+                              " mIgnoreLayers in Pixel HWC code",
+                              hwcDisplayId);
+                        display->getCompositionDisplay()->clearOutputLayers();
+                        getHwComposer().executeCommands(*displayIdOpt);
+                    }
+                }
+            }
+        }
+
         auto info = getHwComposer().onHotplug(hwcDisplayId, event);
         if (!info) {
             continue;
@@ -4771,6 +4871,20 @@ void SurfaceFlinger::processDisplayAdded(const wp<IBinder>& displayToken,
 // QTI_BEGIN: 2023-01-24: Display: sf: Add support for multiple displays
         qtiCanAllocateHwcForVDS = mQtiSFExtnIntf->qtiCanAllocateHwcDisplayIdForVDS(state);
 // QTI_END: 2023-01-24: Display: sf: Add support for multiple displays
+#ifdef QCOM_UM_FAMILY
+        // crDroid: allow HWC for VDS when the vendor/AOSP properties permit it
+        size_t maxVirtualDisplaySize = getHwComposer().getMaxVirtualDisplayDimension();
+        if (maxVirtualDisplaySize == 0 || ((uint64_t)resolution.width <= maxVirtualDisplaySize &&
+            (uint64_t)resolution.height <= maxVirtualDisplaySize)) {
+            uint64_t usage = 0;
+            // Replace with native_window_get_consumer_usage ?
+            status = state.getVirtual().surface->getConsumerUsage(&usage);
+            ALOGW_IF(status != NO_ERROR, "Unable to query usage (%d)", status);
+            if ((status == NO_ERROR) && canAllocateHwcDisplayIdForVDS(usage)) {
+                qtiCanAllocateHwcForVDS = true;
+            }
+        }
+#endif
     } else {
         // Virtual displays without a surface are dormant:
         // they have external state (layer stack, projection,
@@ -5580,6 +5694,9 @@ void SurfaceFlinger::initScheduler(const sp<const DisplayDevice>& display) {
     if (mBackpressureGpuComposition) {
         features |= Feature::kBackpressureGpuComposition;
     }
+    if (mPropagateBackpressure) {
+        features |= Feature::kPropagateBackpressure;
+    }
     if (getHwComposer().getComposer()->isSupported(
                 Hwc2::Composer::OptionalFeature::ExpectedPresentTime)) {
         features |= Feature::kExpectedPresentTime;
@@ -5829,10 +5946,13 @@ TransactionHandler::TransactionReadiness SurfaceFlinger::transactionReadyBufferC
                     return TraverseBuffersReturnValues::STOP_TRAVERSAL;
                 }
 
+                // ignore the acquire fence if LatchUnsignaledConfig::Always is set.
+                const bool checkAcquireFence =
+                        enableLatchUnsignaledConfig != LatchUnsignaledConfig::Always;
                 const bool acquireFenceAvailable = s.bufferData &&
                         s.bufferData->flags.test(BufferData::BufferDataChange::fenceChanged) &&
                         s.bufferData->acquireFence;
-                const bool fenceSignaled = !acquireFenceAvailable ||
+                const bool fenceSignaled = !checkAcquireFence || !acquireFenceAvailable ||
                         s.bufferData->acquireFence->getStatus() != Fence::Status::Unsignaled;
 
                 sp<Layer> layerHandle = LayerHandle::getLayer(s.surface);
@@ -5951,6 +6071,11 @@ bool SurfaceFlinger::shouldLatchUnsignaled(const layer_state_t& state, size_t nu
     if (enableLatchUnsignaledConfig == LatchUnsignaledConfig::Disabled) {
         SFTRACE_FORMAT_INSTANT("%s: false (LatchUnsignaledConfig::Disabled)", __func__);
         return false;
+    }
+
+    if (enableLatchUnsignaledConfig == LatchUnsignaledConfig::Always) {
+        SFTRACE_FORMAT_INSTANT("%s: true (LatchUnsignaledConfig::Always)", __func__);
+        return true;
     }
 
     // We only want to latch unsignaled when a single layer is updated in this
@@ -9679,6 +9804,35 @@ void SurfaceFlinger::updateWorkDuration(const sp<DisplayDevice>& display,
                                              Duration::fromNs(workDuration->appDurationNanos));
     }
 }
+
+#ifdef QCOM_UM_FAMILY
+bool SurfaceFlinger::canAllocateHwcDisplayIdForVDS(uint64_t usage) {
+    uint64_t flag_mask_pvt_wfd = ~0;
+    uint64_t flag_mask_hw_video = ~0;
+    // Reserve hardware acceleration for WFD use-case
+    // GRALLOC_USAGE_PRIVATE_WFD + GRALLOC_USAGE_HW_VIDEO_ENCODER = WFD using HW composer.
+    flag_mask_pvt_wfd = GRALLOC_USAGE_PRIVATE_WFD;
+    flag_mask_hw_video = GRALLOC_USAGE_HW_VIDEO_ENCODER;
+    bool isWfd = (usage & flag_mask_pvt_wfd) && (usage & flag_mask_hw_video);
+    // Enabling only the vendor property would allow WFD to use HWC
+    // Enabling both the aosp and vendor properties would allow all other VDS to use HWC
+    // Disabling both would set all virtual displays to fall back to GPU
+    // In vendor frozen targets, allow WFD to use HWC without any property settings.
+    bool canAllocate = mAllowHwcForVDS || (isWfd && mAllowHwcForWFD) || (isWfd &&
+                       mFirstApiLevel < __ANDROID_API_T__);
+
+    if (canAllocate) {
+        enableHalVirtualDisplays(true);
+    }
+
+    return canAllocate;
+
+}
+#else
+bool SurfaceFlinger::canAllocateHwcDisplayIdForVDS(uint64_t) {
+    return true;
+}
+#endif
 
 status_t SurfaceFlinger::setDesiredDisplayModeSpecs(
         const sp<IBinder>& applyToken, const std::vector<gui::DisplayModeSpecs>& perDisplaySpecs) {

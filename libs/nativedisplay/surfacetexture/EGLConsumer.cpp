@@ -593,8 +593,9 @@ void EGLConsumer::onAbandonLocked() {
 }
 
 EGLConsumer::EglImage::EglImage(sp<GraphicBuffer> graphicBuffer)
-// QTI_BEGIN: 2024-02-27: Graphics: nativedisplay: fix video call flicker issue
       : mGraphicBuffer(graphicBuffer), mEglImage(EGL_NO_IMAGE_KHR), mEglDisplay(EGL_NO_DISPLAY) {
+    mDataSpace = ui::Dataspace::UNKNOWN;
+// QTI_BEGIN: 2024-02-27: Graphics: nativedisplay: fix video call flicker issue
     mQtiEglImageExtn = std::make_shared<android::libnativedisplay::QtiEglImageExtension>(this);
 }
 // QTI_END: 2024-02-27: Graphics: nativedisplay: fix video call flicker issue
@@ -617,8 +618,16 @@ status_t EGLConsumer::EglImage::createIfNeeded(EGLDisplay eglDisplay, bool force
     bool qtiDataSpaceChanged = mQtiEglImageExtn->dataSpaceChanged();
 
 // QTI_END: 2024-02-27: Graphics: nativedisplay: fix video call flicker issue
+    ui::Dataspace dataspace;
+    bool dataspaceChanged = false;
+    if (mGraphicBuffer->getDataspace(&dataspace) == 0 ) {
+         dataspaceChanged = (mDataSpace != dataspace)? true:false;
+         if(dataspaceChanged)
+             ALOGI("createIfNeeded: Recreate new EGLImage since dataspace changed");
+    }
+
     if (haveImage && (displayInvalid || forceCreation ||
-            qtiDataSpaceChanged)) {
+            qtiDataSpaceChanged || dataspaceChanged)) {
         if (!eglDestroyImageKHR(mEglDisplay, mEglImage)) {
             ALOGE("createIfNeeded: eglDestroyImageKHR failed");
         }
@@ -641,6 +650,10 @@ status_t EGLConsumer::EglImage::createIfNeeded(EGLDisplay eglDisplay, bool force
               buffer->getWidth(), buffer->getHeight(), buffer->getStride(), buffer->getUsage(),
               buffer->getPixelFormat());
         return UNKNOWN_ERROR;
+    }
+    
+    if (dataspaceChanged) {
+        mDataSpace = dataspace;
     }
 
 // QTI_BEGIN: 2024-02-27: Graphics: nativedisplay: fix video call flicker issue

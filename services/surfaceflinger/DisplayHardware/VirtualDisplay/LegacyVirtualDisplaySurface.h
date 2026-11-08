@@ -121,7 +121,7 @@ public:
 private:
     LegacyVirtualDisplaySurface(HWComposer&, VirtualDisplayIdVariant,
                                 const sp<Surface>& sink,
-                                const std::string& name, bool qtiSecure = false);
+                                const std::string& name, bool secure = false);
 
     friend class sp<LegacyVirtualDisplaySurface>;
 
@@ -168,6 +168,7 @@ private:
                                          float outTransformMatrix[16]) override;
     virtual status_t getUniqueId(uint64_t* outId) const override;
     virtual status_t getConsumerUsage(uint64_t* outUsage) const override;
+    virtual void setOutputUsage(uint64_t flag);
 
     //
     // Utility methods
@@ -314,6 +315,8 @@ private:
 // QTI_BEGIN: 2023-01-24: Display: sf: Add support for multiple displays
     android::surfaceflingerextension::QtiDisplaySurfaceExtensionIntf* mQtiDSExtnIntf = nullptr;
 // QTI_END: 2023-01-24: Display: sf: Add support for multiple displays
+    bool mSecure;
+    int mSinkUsage;
 };
 
 } // namespace android

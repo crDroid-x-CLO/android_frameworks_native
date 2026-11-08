@@ -31,6 +31,7 @@
 #include <ui/GraphicBufferMapper.h>
 #include <ui/PixelFormat.h>
 #include <ui/Rect.h>
+#include <ui/GraphicTypes.h>
 #include <utils/Flattenable.h>
 #include <utils/RefBase.h>
 // QTI_BEGIN: 2024-02-27: Graphics: nativedisplay: fix video call flicker issue
@@ -177,6 +178,10 @@ public:
     }
 
 // QTI_END: 2024-02-27: Graphics: nativedisplay: fix video call flicker issue
+    status_t getDataspace(ui::Dataspace* outDataspace){
+        return mBufferMapper.getDataspace(handle, outDataspace);
+    }
+
     uint32_t getGenerationNumber() const { return mGenerationNumber; }
     void setGenerationNumber(uint32_t generation) {
         mGenerationNumber = generation;
