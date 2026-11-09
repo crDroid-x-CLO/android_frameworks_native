@@ -118,7 +118,8 @@ std::optional<android::VirtualDisplayIdVariant> QtiNullExtension::qtiAcquireVirt
         ui::Size resolution, ui::PixelFormat format, const std::string& uniqueId, compositionengine::DisplayCreationArgsBuilder& builder, bool canAllocateHwcForVDS) {
     ConditionalLock lock(mQtiFlinger->mStateLock,
                          std::this_thread::get_id() != mQtiFlinger->mMainThreadId);
-    return mQtiFlinger->acquireVirtualDisplay(resolution, format, uniqueId, builder);
+    return mQtiFlinger->acquireVirtualDisplay(resolution, format, uniqueId, builder,
+                                              canAllocateHwcForVDS);
 }
 bool QtiNullExtension::qtiCanAllocateHwcDisplayIdForVDS(const DisplayDeviceState& state) {
     return false;
